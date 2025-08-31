@@ -10,6 +10,7 @@ from workout_api.centro_treinamento.models import CentroTreinamentoModel
 
 from workout_api.contrib.dependencies import DatabaseDependency
 from sqlalchemy.future import select
+from sqlalchemy.exc import IntegrityError
 
 router = APIRouter()
 
@@ -26,35 +27,66 @@ async def post(
     categoria_nome = atleta_in.categoria.nome
     centro_treinamento_nome = atleta_in.centro_treinamento.nome
 
-    categoria = (await db_session.execute(
-        select(CategoriaModel).filter_by(nome=categoria_nome))
+    # Verifica se a categoria existe
+    categoria = (
+        await db_session.execute(
+            select(CategoriaModel).filter_by(nome=categoria_nome)
+        )
     ).scalars().first()
-    
+
     if not categoria:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, 
             detail=f'A categoria {categoria_nome} não foi encontrada.'
         )
-    
-    centro_treinamento = (await db_session.execute(
-        select(CentroTreinamentoModel).filter_by(nome=centro_treinamento_nome))
+
+    # Verifica se o centro de treinamento existe
+    centro_treinamento = (
+        await db_session.execute(
+            select(CentroTreinamentoModel).filter_by(nome=centro_treinamento_nome)
+        )
     ).scalars().first()
-    
+
     if not centro_treinamento:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, 
             detail=f'O centro de treinamento {centro_treinamento_nome} não foi encontrado.'
         )
-    try:
-        atleta_out = AtletaOut(id=uuid4(), created_at=datetime.utcnow(), **atleta_in.model_dump())
-        atleta_model = AtletaModel(**atleta_out.model_dump(exclude={'categoria', 'centro_treinamento'}))
 
-        atleta_model.categoria_id = categoria.pk_id
-        atleta_model.centro_treinamento_id = centro_treinamento.pk_id
-        
-        db_session.add(atleta_model)
+    # Cria atleta
+    atleta_out = AtletaOut(
+        id=uuid4(),
+        created_at=datetime.utcnow(),
+        **atleta_in.model_dump()
+    )
+    atleta_model = AtletaModel(
+        **atleta_out.model_dump(exclude={'categoria', 'centro_treinamento'})
+    )
+
+    atleta_model.categoria_id = categoria.pk_id
+    atleta_model.centro_treinamento_id = centro_treinamento.pk_id
+
+    db_session.add(atleta_model)
+
+    try:
         await db_session.commit()
+    except IntegrityError as e:
+        await db_session.rollback()
+
+        # Tratamento específico para CPF duplicado
+        if "cpf" in str(e.orig).lower():
+            raise HTTPException(
+                status_code=status.HTTP_303_SEE_OTHER,
+                detail=f"Já existe um atleta cadastrado com o CPF: {atleta_in.cpf}"
+            )
+
+        # Outros erros de integridade
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Erro de integridade nos dados enviados."
+        )
     except Exception:
+        await db_session.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
             detail='Ocorreu um erro ao inserir os dados no banco'
@@ -92,6 +124,49 @@ async def get(id: UUID4, db_session: DatabaseDependency) -> AtletaOut:
             detail=f'Atleta não encontrado no id: {id}'
         )
     
+    return atleta
+
+
+@router.get(
+    '/nome/{nome}',
+    summary='Consulta um Atleta pelo nome',
+    status_code=status.HTTP_200_OK,
+    response_model=list[AtletaOut],
+)
+async def get_by_nome(nome: str, db_session: DatabaseDependency) -> list[AtletaOut]:
+    atletas = (
+        await db_session.execute(
+            select(AtletaModel).filter(AtletaModel.nome.ilike(f"%{nome}%"))
+        )
+    ).scalars().all()
+
+    if not atletas:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f'Nenhum atleta encontrado com nome contendo: {nome}'
+        )
+
+    return atletas
+
+@router.get(
+    '/cpf/{cpf}',
+    summary='Consulta um Atleta pelo CPF',
+    status_code=status.HTTP_200_OK,
+    response_model=AtletaOut,
+)
+async def get_by_cpf(cpf: str, db_session: DatabaseDependency) -> AtletaOut:
+    atleta = (
+        await db_session.execute(
+            select(AtletaModel).filter_by(cpf=cpf)
+        )
+    ).scalars().first()
+
+    if not atleta:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f'Atleta não encontrado com CPF: {cpf}'
+        )
+
     return atleta
 
 
